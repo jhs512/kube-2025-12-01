@@ -3,13 +3,37 @@ hostnamectl set-hostname ec2-1
 ```
 
 ```bash
-kubeadm init --control-plane-endpoint "ec2-13-125-240-33.ap-northeast-2.compute.amazonaws.com:6443" --upload-certs --pod-network-cidr=10.10.0.0/16 -v=5
+sudo tee /etc/profile.d/ec2_metadata_env.sh > /dev/null << 'EOF'
+#!/bin/bash
+
+# IMDSv2 토큰 요청
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+# 토큰이 정상적으로 발급된 경우에만 변수 설정
+if [ -n "$TOKEN" ]; then
+  # 공인 IPv4
+  export EC2_PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/public-ipv4)
+
+  # 공인 Hostname
+  export EC2_PUBLIC_HOSTNAME=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/public-hostname)
+fi
+EOF
 ```
 
 ```bash
-mkdir -p $HOME/.kube
-sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
+sudo chmod +x /etc/profile.d/ec2_metadata_env.sh
+```
+
+```bash
+source /etc/profile.d/ec2_metadata_env.sh
+```
+
+```bash
+echo $EC2_PUBLIC_IP
+echo $EC2_PUBLIC_HOSTNAME
 ```
 
 ```bash
@@ -27,6 +51,22 @@ echo 'alias k=kubectl' >> ~/.bashrc
 echo 'complete -o default -F __start_kubectl k' >> ~/.bashrc
 
 source ~/.bashrc
+```
+
+```bash
+kubeadm init --control-plane-endpoint "$EC2_PUBLIC_HOSTNAME:6443" --upload-certs --pod-network-cidr=10.10.0.0/16 -v=5
+```
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+```bash
+kubectl describe node ec2-1 | grep -i Taints # 확인
+kubectl taint nodes ec2-1 node-role.kubernetes.io/control-plane- # 제거
+kubectl describe node ec2-1 | grep -i Taints # 확인
 ```
 
 ```bash
@@ -138,43 +178,48 @@ kubectl create -f /kube/calico-resources.yaml
 ```
 
 ```bash
-kubectl describe node ec2-1 | grep -i Taints # 확인
-kubectl taint nodes ec2-1 node-role.kubernetes.io/control-plane- # 제거
-kubectl describe node ec2-1 | grep -i Taints # 확인
+kubectl wait --for=condition=Ready node/ec2-1 --timeout=300s
 ```
 
 ```bash
-# 1) MetalLB 설치 (v0.14.5 기준)
+# 1) MetalLB 설치
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
 
-# 2) MetalLB IP 풀 + L2 광고 설정 파일 생성
+# 2) MetalLB 컨트롤러가 살아날 때까지 대기
+#    - 웹훅이 준비되기 전에 IPAddressPool 만들면 connection refused 에러 나서 이거 하나만 추가
+kubectl wait -n metallb-system \
+  --for=condition=Available deployment/controller \
+  --timeout=300s
+
+# 3) MetalLB IP 풀 + L2 광고 설정 파일 생성
+#    - EC2_PUBLIC_IP 환경변수에 들어있는 공인 IP 한 개만 풀로 사용
 cat <<EOF | tee metallb-config.yaml
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
-  name: public-pool                 # ← IP 풀 이름
-  namespace: metallb-system         # ← MetalLB 네임스페이스(기본)
+  name: public-pool
+  namespace: metallb-system
 spec:
   addresses:
-    - "13.125.240.33-13.125.240.33" # ← 여기 AWS 공인 IP(Elastic IP) 한 개만 풀로 사용
+    - "${EC2_PUBLIC_IP}-${EC2_PUBLIC_IP}"
 ---
 apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
 metadata:
-  name: public-ad                   # ← L2 광고 리소스 이름
+  name: public-ad
   namespace: metallb-system
 spec:
   ipAddressPools:
-    - public-pool                   # ← 위에서 만든 IPAddressPool을 사용
+    - public-pool
 EOF
 
-# 3) 설정 적용
+# 4) 설정 적용
 kubectl apply -f metallb-config.yaml
 
-# 4) 확인용(선택)
-# kubectl get pods -n metallb-system
-# kubectl get ipaddresspool -n metallb-system
-# kubectl get l2advertisement -n metallb-system
+# 5) 확인용(선택)
+kubectl get pods -n metallb-system
+kubectl get ipaddresspool -n metallb-system
+kubectl get l2advertisement -n metallb-system
 ```
 
 ```bash
@@ -204,20 +249,32 @@ cd /kube/ingress-nginx
 
 helm show values ingress-nginx/ingress-nginx > nginx-ingress.yaml
 
-sed -i \
-  -e 's/hostNetwork: false/hostNetwork: true/' \
-  -e 's/enabled: false/enabled: true/' \
-  -e 's/kind: Deployment/kind: DaemonSet/' \
-  nginx-ingress.yaml
+sed -i '
+  # hostNetwork true로
+  s/  hostNetwork: .*/  hostNetwork: true/;
+
+  # hostPort 블록 내부의 enabled만 true로 교체
+  /hostPort:/,/ports:/ s/^ *enabled: .*/    enabled: true/;
+
+  # kind를 Deployment → DaemonSet
+  s/  kind: Deployment/  kind: DaemonSet/;
+' nginx-ingress.yaml
 
 helm install ingress-nginx ingress-nginx/ingress-nginx -f nginx-ingress.yaml -n ingress-nginx --create-namespace
 ```
 
 ```bash
+# ingress-nginx 네임스페이스의 controller Pod 준비 대기 (최대 120초)
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  -l app.kubernetes.io/component=controller \
+  --timeout=120s
+```
+
+```bash
 mkdir -p /kube/ingress-test && cd /kube/ingress-test
 
-# ingress-test.yaml 생성
-cat <<'EOF' > ingress-test.yaml
+cat <<EOF > ingress-test.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -262,7 +319,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: ec2-13-125-240-33.ap-northeast-2.compute.amazonaws.com
+  - host: ${EC2_PUBLIC_HOSTNAME}   # ← 여기서 변수 확장됨
     http:
       paths:
       - path: /
@@ -274,6 +331,6 @@ spec:
               number: 80
 EOF
 
-# apply
+# 적용
 kubectl apply -f ingress-test.yaml
 ```
